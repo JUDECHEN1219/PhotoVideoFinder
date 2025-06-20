@@ -1,0 +1,246 @@
+// FolderView
+
+import SwiftUI
+import AVFoundation
+import AppKit
+import SwiftData
+
+struct FolderView: View {
+    let folderURL: URL
+    let onFolderTapped: (URL) -> Void
+    @State private var items: [FileItem] = []
+    @State private var thumbnails: [URL: NSImage] = [:]
+    @State private var thumbnailScale: CGFloat = 1.0
+    
+    @Environment(\.modelContext) private var modelContext
+    @Query private var thumbnailRecords: [ThumbnailCache]
+    
+    @State private var hoveredItem: URL? = nil
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // 视频部分
+                if !videoItems.isEmpty {
+                    Text("🎞 视频文件")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    let originalImageSize: CGFloat = 3
+                    
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.adaptive(minimum: 128 * originalImageSize * thumbnailScale), spacing: 5)
+                        ],
+                        spacing: 16  // 垂直方向的行间距
+                    ) {
+                        ForEach(videoItems) { item in
+                            VStack {
+                                if let image = thumbnails[item.url] {
+                                    Image(nsImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 128 * originalImageSize * thumbnailScale, height: 72 * originalImageSize * thumbnailScale)
+                                        .clipShape(RoundedRectangle(cornerRadius: 2 * thumbnailScale, style: .continuous))
+                                        .shadow(radius: 1)
+                                } else {
+                                    Rectangle()
+                                        .fill(Color.gray.opacity(0.2))
+                                        .frame(width: 128 * originalImageSize * thumbnailScale, height: 72 * originalImageSize * thumbnailScale)
+                                        .overlay(ProgressView())
+                                }
+                                Text(item.name)
+                                    .font(.caption)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(4)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(hoveredItem == item.url ? Color.accentColor.opacity(0.12) : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(hoveredItem == item.url ? Color.accentColor.opacity(0.4) : Color.clear, lineWidth: 1)
+                            )
+//                            .animation(.easeInOut(duration: 0.2), value: hoveredItem == item.url)
+                            .onHover { hovering in
+                                hoveredItem = hovering ? item.url : nil
+                            }
+                            .onTapGesture {
+                                NSWorkspace.shared.open(item.url)
+                            }
+                        }
+                    }
+                    Divider().background(Color.white)
+                }
+
+                // 文件夹部分
+                if !folderItems.isEmpty {
+                    Text("📁 子文件夹")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 110 ))], spacing: 0) {
+                        ForEach(folderItems) { item in
+                            VStack(spacing: 1) {
+                                Image(nsImage: NSWorkspace.shared.icon(forFile: item.url.path))
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 100, height: 100)
+                                    .padding(.bottom, -5)
+                                Text(item.name)
+                                    .font(.caption)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(4)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(hoveredItem == item.url ? Color.accentColor.opacity(0.12) : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(hoveredItem == item.url ? Color.accentColor.opacity(0.4) : Color.clear, lineWidth: 1)
+                            )
+//                            .animation(.easeInOut(duration: 0), value: hoveredItem == item.url)
+                            .onHover { hovering in
+                                hoveredItem = hovering ? item.url : nil
+                            }
+                            .onTapGesture {
+                                onFolderTapped(item.url)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding()
+        }
+        .onAppear { loadContents() }
+        .onChange(of: folderURL) { loadContents() }
+        .toolbar {
+            ToolbarItemGroup {
+                Button {
+                    if thumbnailScale < 5.0 {
+                        thumbnailScale += 0.25
+                    }
+                } label: {
+                    Image(systemName: "plus.magnifyingglass")
+                }
+
+                Button {
+                    if thumbnailScale > 0.5 {
+                        thumbnailScale -= 0.25
+                    }
+                } label: {
+                    Image(systemName: "minus.magnifyingglass")
+                }
+            }
+        }
+    }
+
+    private var videoItems: [FileItem] {
+        items.filter { !$0.isDirectory }
+    }
+
+    private var folderItems: [FileItem] {
+        items.filter { $0.isDirectory }
+    }
+
+    private func loadContents() {
+        let fm = FileManager.default
+        let videoExtensions: Set<String> = ["mp4", "mov", "mkv", "avi", "flv", "wmv", "m4v"]
+
+        guard let urls = try? fm.contentsOfDirectory(
+            at: folderURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            items = []
+            return
+        }
+
+        items = urls.compactMap { url in
+            guard let isDir = try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory else {
+                return nil
+            }
+
+            if isDir || videoExtensions.contains(url.pathExtension.lowercased()) {
+                return FileItem(name: url.lastPathComponent, url: url, isDirectory: isDir)
+            } else {
+                return nil
+            }
+        }
+
+        for item in items where !item.isDirectory && thumbnails[item.url] == nil {
+            generateThumbnail(for: item.url)
+        }
+    }
+
+    private func generateThumbnail(for url: URL) {
+        // 检查是否已有缓存
+        let videoPath = url.standardized.path
+        
+        // 查询缓存
+        if let record = thumbnailRecords.first(where: { $0.videoPath == videoPath }),
+           let image = NSImage(data: record.thumbnailData) {
+            thumbnails[url] = image
+            print("✅ 从缓存读取图像")
+            return
+        }
+    
+        // 否则生成缩略图
+        DispatchQueue.global().async {
+            let tempDir = FileManager.default.temporaryDirectory
+            let outputPath = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
+
+            guard let ffmpegPath = Bundle.main.path(forResource: "ffmpeg", ofType: nil) else {
+                print("❌ 无法找到 ffmpeg 可执行文件")
+                return
+            }
+
+            let _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffmpegPath)
+            print("📍 使用打包 ffmpeg: \(ffmpegPath)")
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ffmpegPath)
+            process.arguments = [
+                "-ss", "00:00:01.000",
+                "-i", url.path,
+                "-frames:v", "1",
+                "-q:v", "2",
+                "-update", "1",
+                "-y", outputPath.path
+            ]
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                if process.terminationStatus == 0,
+                   let imageData = try? Data(contentsOf: outputPath),
+                   let image = NSImage(data: imageData) {
+
+                    DispatchQueue.main.async {
+                        thumbnails[url] = image
+
+                        let record = ThumbnailCache(videoPath: videoPath, thumbnailData: imageData)
+                        modelContext.insert(record)
+
+                        do {
+                            try modelContext.save()
+                        } catch {
+                            print("❌ 缓存写入失败：\(error)")
+                        }
+                    }
+                } else {
+                    print("❌ ffmpeg 生成失败: \(url.lastPathComponent)")
+                }
+
+                try? FileManager.default.removeItem(at: outputPath)
+            } catch {
+                print("❌ ffmpeg 执行错误: \(error.localizedDescription)")
+            }
+        }
+    }
+}
