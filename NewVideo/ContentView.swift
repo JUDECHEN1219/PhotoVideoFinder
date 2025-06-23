@@ -131,3 +131,7 @@ struct ContentView: View {
 }
 
 // Test
+<<<<<<< HEAD
+=======
+//adsfasdfasdfsadfads
+>>>>>>> 9f31e27 (Add design file)
