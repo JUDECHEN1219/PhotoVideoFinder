@@ -11,8 +11,20 @@ struct ContentView: View {
     @State private var isImporterPresented = false
     
     @Environment(\.modelContext) private var modelContext
-    @Query private var thumbnailRecords: [ThumbnailCache]
-
+    
+    private func clearAllThumbnailCache() {
+        let descriptor = FetchDescriptor<ThumbnailCache>()  // 获取所有记录
+        do {
+            let records = try modelContext.fetch(descriptor)
+            for record in records {
+                modelContext.delete(record)
+            }
+            try modelContext.save()
+            print("🗑 所有缩略图缓存已清空")
+        } catch {
+            print("❌ 清空缓存失败：\(error)")
+        }
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -61,10 +73,7 @@ struct ContentView: View {
                 // delete cache
                 ToolbarItem {
                     Button(role: .destructive) {
-                        for record in thumbnailRecords {
-                            modelContext.delete(record)
-                        }
-                        try? modelContext.save()
+                        clearAllThumbnailCache()
                         print("🗑 缓存清空完成")
                     } label: {
                         Label("清空缓存", systemImage: "eraser")

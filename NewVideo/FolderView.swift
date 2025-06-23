@@ -1,3 +1,4 @@
+
 // FolderView
 
 import SwiftUI
@@ -5,10 +6,18 @@ import AVFoundation
 import AppKit
 import SwiftData
 
+
 let imageThumbnailQueue: OperationQueue = {
     let queue = OperationQueue()
     queue.name = "com.yourapp.imageThumbnailQueue"
-    queue.maxConcurrentOperationCount = 4
+    queue.maxConcurrentOperationCount = 2
+    return queue
+}()
+
+let videoThumbnailQueue: OperationQueue = {
+    let queue = OperationQueue()
+    queue.name = "com.yourapp.videoThumbnailQueue"
+    queue.maxConcurrentOperationCount = 2  // 同时最多处理两个视频缩略图
     return queue
 }()
 
@@ -18,23 +27,24 @@ struct FolderView: View {
     @State private var items: [FileItem] = []
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var thumbnailScale: CGFloat = 1.0
-    
-    @Environment(\.modelContext) private var modelContext
-    @Query private var thumbnailRecords: [ThumbnailCache]
-    
     @State private var hoveredItem: URL? = nil
-    
     @State private var lastMagnification: CGFloat = 1.0
 
+    @Environment(\.modelContext) private var modelContext
 
     var body: some View {
         VStack(spacing: 0) {
             buildFilesView()
-            
             Divider()
-
             buildStatusView()
         }
+    }
+
+    private func fetchThumbnail(for path: String) -> ThumbnailCache? {
+        let descriptor = FetchDescriptor<ThumbnailCache>(
+            predicate: #Predicate { $0.videoPath == path }
+        )
+        return try? modelContext.fetch(descriptor).first
     }
     
     @ViewBuilder
@@ -44,6 +54,8 @@ struct FolderView: View {
             Label("文件：\(folderItems.count)", systemImage: "folder")
             Text("|").foregroundColor(.secondary)
             Label("影片：\(videoItems.count)", systemImage: "film")
+            Text("|").foregroundColor(.secondary)
+            Label("图片：\(imageItems.count)", systemImage: "photo")
 
             Spacer()
 
@@ -225,13 +237,6 @@ struct FolderView: View {
             .padding()
         }
         .onAppear {
-            // 1. 取消所有正在生成的图片缩略图任务
-            imageThumbnailQueue.cancelAllOperations()
-            
-            // 2. 清空缩略图缓存（防止旧图片显示）
-            thumbnails.removeAll()
-
-            // 3. 加载新目录内容
             loadContents()
         }
         .onChange(of: folderURL) {
@@ -280,6 +285,12 @@ struct FolderView: View {
         )
     }
 
+    private func refreshFolder() {
+        imageThumbnailQueue.cancelAllOperations()
+        thumbnails.removeAll()
+        loadContents()
+    }
+    
     private var videoItems: [FileItem] {
         let videoExtensions: Set<String> = ["mp4", "mov", "mkv", "avi", "flv", "wmv", "m4v"]
         return items.filter {
@@ -304,7 +315,6 @@ struct FolderView: View {
         let videoExtensions: Set<String> = ["mp4", "mov", "mkv", "avi", "flv", "wmv", "m4v"]
         let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "bmp", "gif", "tiff", "heic"]
 
-
         guard let urls = try? fm.contentsOfDirectory(
             at: folderURL,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -315,93 +325,85 @@ struct FolderView: View {
         }
 
         items = urls.compactMap { url in
-            guard let isDir = try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory else {
-                return nil
-            }
-
+            guard let isDir = try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory else { return nil }
             let ext = url.pathExtension.lowercased()
-            
-            if isDir || videoExtensions.contains(ext) || imageExtensions.contains(ext) {
-                return FileItem(name: url.lastPathComponent, url: url, isDirectory: isDir)
-            } else {
-                return nil
-            }
+            return (isDir || videoExtensions.contains(ext) || imageExtensions.contains(ext)) ?
+                FileItem(name: url.lastPathComponent, url: url, isDirectory: isDir) : nil
         }
 
-        // 生成视频缩略图
-        for item in items where !item.isDirectory && videoExtensions.contains(item.url.pathExtension.lowercased()) && thumbnails[item.url] == nil {
-            generateVideoThumbnail(for: item.url)
-        }
-        
-        // 生成图片缩略图（可选：用于缩略图缓存）
-        for item in items where !item.isDirectory && imageExtensions.contains(item.url.pathExtension.lowercased()) && thumbnails[item.url] == nil {
-            generateImageThumbnail(for: item.url)
+        for item in items where !item.isDirectory {
+            let ext = item.url.pathExtension.lowercased()
+            if videoExtensions.contains(ext) {
+                generateVideoThumbnail(for: item.url)
+            } else if imageExtensions.contains(ext) {
+                generateImageThumbnail(for: item.url)
+            }
         }
     }
-
+    
     private func generateVideoThumbnail(for url: URL) {
-        // 检查是否已有缓存
         let videoPath = url.standardized.path
-        
-        // 查询缓存
-        if let record = thumbnailRecords.first(where: { $0.videoPath == videoPath }),
+
+        if let record = fetchThumbnail(for: videoPath),
            let image = NSImage(data: record.thumbnailData) {
             thumbnails[url] = image
-            print("✅ 从缓存读取图像")
             return
         }
-    
-        // 否则生成缩略图
-        DispatchQueue.global().async {
-            let tempDir = FileManager.default.temporaryDirectory
-            let outputPath = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
 
-            guard let ffmpegPath = Bundle.main.path(forResource: "ffmpeg", ofType: nil) else {
-                print("❌ 无法找到 ffmpeg 可执行文件")
-                return
-            }
+        // 使用限制并发的缩略图任务队列
+        videoThumbnailQueue.addOperation {
+            autoreleasepool {
+                let tempDir = FileManager.default.temporaryDirectory
+                let outputPath = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
 
-            let _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffmpegPath)
-            print("📍 使用打包 ffmpeg: \(ffmpegPath)")
-
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: ffmpegPath)
-            process.arguments = [
-                "-ss", "00:00:01.000",
-                "-i", url.path,
-                "-frames:v", "1",
-                "-q:v", "2",
-                "-update", "1",
-                "-y", outputPath.path
-            ]
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-
-                if process.terminationStatus == 0,
-                   let imageData = try? Data(contentsOf: outputPath),
-                   let image = NSImage(data: imageData) {
-
-                    DispatchQueue.main.async {
-                        thumbnails[url] = image
-
-                        let record = ThumbnailCache(videoPath: videoPath, thumbnailData: imageData)
-                        modelContext.insert(record)
-
-                        do {
-                            try modelContext.save()
-                        } catch {
-                            print("❌ 缓存写入失败：\(error)")
-                        }
-                    }
-                } else {
-                    print("❌ ffmpeg 生成失败: \(url.lastPathComponent)")
+                guard let ffmpegPath = Bundle.main.path(forResource: "ffmpeg", ofType: nil) else {
+                    print("❌ 无法找到 ffmpeg 可执行文件")
+                    return
                 }
 
-                try? FileManager.default.removeItem(at: outputPath)
-            } catch {
-                print("❌ ffmpeg 执行错误: \(error.localizedDescription)")
+                // 确保 ffmpeg 可执行权限
+                let _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffmpegPath)
+                print("📍 使用打包 ffmpeg: \(ffmpegPath)")
+
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: ffmpegPath)
+                process.arguments = [
+                    "-ss", "00:00:01.000",
+                    "-i", url.path,
+                    "-frames:v", "1",
+                    "-q:v", "2",
+                    "-update", "1",
+                    "-y", outputPath.path
+                ]
+
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+
+                    if process.terminationStatus == 0,
+                       let imageData = try? Data(contentsOf: outputPath),
+                       let image = NSImage(data: imageData) {
+
+                        DispatchQueue.main.async {
+                            thumbnails[url] = image
+
+                            let record = ThumbnailCache(videoPath: videoPath, thumbnailData: imageData)
+                            modelContext.insert(record)
+
+                            do {
+                                try modelContext.save()
+                            } catch {
+                                print("❌ 缓存写入失败：\(error)")
+                            }
+                        }
+                    } else {
+                        print("❌ ffmpeg 生成失败: \(url.lastPathComponent)")
+                    }
+
+                    try? FileManager.default.removeItem(at: outputPath)
+                } catch {
+                    print("❌ ffmpeg 执行错误: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -410,56 +412,31 @@ struct FolderView: View {
     private func generateImageThumbnail(for url: URL) {
         let imagePath = url.standardized.path
 
-        // 1. 检查缓存
-        if let record = thumbnailRecords.first(where: { $0.videoPath == imagePath }),
-           let image = NSImage(data: record.thumbnailData) {
+        if let record = fetchThumbnail(for: imagePath), let image = NSImage(data: record.thumbnailData) {
             thumbnails[url] = image
-            print("✅ 从缓存读取图片：\(url.lastPathComponent)")
             return
         }
 
-        // 2. 添加任务到缩略图并发队列中
         imageThumbnailQueue.addOperation {
             autoreleasepool {
-                guard var image = NSImage(contentsOf: url) else {
-                    print("❌ 无法读取图片：\(url.lastPathComponent)")
-                    return
-                }
-
+                guard var image = NSImage(contentsOf: url) else { return }
                 let maxWidth: CGFloat = 240
                 let originalSize = image.size
                 let aspectRatio = originalSize.height / originalSize.width
+                let targetSize = NSSize(width: min(originalSize.width, maxWidth), height: min(originalSize.width, maxWidth) * aspectRatio)
 
-                let targetWidth = min(originalSize.width, maxWidth)
-                let targetHeight = targetWidth * aspectRatio
-                let targetSize = NSSize(width: targetWidth, height: targetHeight)
-
-                // 3. 创建缩略图
                 let thumbnail = NSImage(size: targetSize)
                 thumbnail.lockFocus()
-                image.draw(
-                    in: NSRect(origin: .zero, size: targetSize),
-                    from: NSRect(origin: .zero, size: originalSize),
-                    operation: .copy,
-                    fraction: 1.0
-                )
+                image.draw(in: NSRect(origin: .zero, size: targetSize), from: NSRect(origin: .zero, size: originalSize), operation: .copy, fraction: 1.0)
                 thumbnail.unlockFocus()
+                image = NSImage()
 
-                image = NSImage()  // ⬅️ 显式释放原图内存
-
-                // 4. 主线程更新 UI 和存入缓存
                 DispatchQueue.main.async {
                     thumbnails[url] = thumbnail
-
                     if let imageData = thumbnail.tiffRepresentation {
                         let record = ThumbnailCache(videoPath: imagePath, thumbnailData: imageData)
                         modelContext.insert(record)
-                        do {
-                            try modelContext.save()
-                            print("💾 图片缓存已保存：\(url.lastPathComponent)")
-                        } catch {
-                            print("❌ 图片缓存保存失败：\(error)")
-                        }
+                        try? modelContext.save()
                     }
                 }
             }
